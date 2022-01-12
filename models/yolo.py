@@ -51,10 +51,19 @@ class Detect(nn.Module):
                     self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
 
                 y = x[i].sigmoid()
-                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                if torch.onnx.is_in_onnx_export():
+                    _anchor_grid = y.new_tensor(self.anchor_grid[i].data)
+                    xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                    wh = (y[..., 2:4] * 2) ** 2 * _anchor_grid  # wh
+                    y = torch.cat((xy, wh, y[..., 4:]), -1)
+                else:
+                    y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 z.append(y.view(bs, -1, self.no))
 
+        if torch.onnx.is_in_onnx_export():
+            output = torch.cat(z, 1)
+            return output.type_as(x[i])  # keep the same type with x
         return x if self.training else (torch.cat(z, 1), x)
 
     @staticmethod
@@ -279,6 +288,19 @@ class Model(nn.Module):
 
     def info(self, verbose=False, img_size=640):  # print model information
         model_info(self, verbose, img_size)
+
+    def _apply(self, fn):
+        # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
+        self = super()._apply(fn)
+        m = self.model[-1]  # Detect()
+        if isinstance(m, Detect):
+            m.stride = fn(m.stride)
+            m.grid = list(map(fn, m.grid))
+            if isinstance(m.anchor_grid, list):
+                m.anchor_grid = list(map(fn, m.anchor_grid))
+            else:
+                m.anchor_grid = fn(m.anchor_grid)
+        return self
 
 
 def parse_model(d, ch):  # model_dict, input_channels(3)
